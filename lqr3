@@ -1,0 +1,173 @@
+# simulation_lqr.py 파일 내용 (LQR 성능 튜닝 최종본)
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+import control as ct
+
+# --- 0. 한글 폰트 설정 (Windows 기준) ---
+try:
+    plt.rcParams['font.family'] = 'Malgun Gothic' # Windows 기본 폰트
+    plt.rcParams['axes.unicode_minus'] = False # 마이너스 기호 깨짐 방지
+except:
+    print("한글 폰트(맑은 고딕) 설정에 실패했습니다. 그래프의 한글이 깨질 수 있습니다.")
+
+# --- 1. LQR 제어기 클래스 (수정 없음) ---
+class LQRControllerPython:
+    def __init__(self, A, B, Q, R, desired_state):
+        self.A, self.B, self.Q, self.R = A, B, Q, R
+        self.desired_state = np.asarray(desired_state)
+        
+        # K 행렬 계산 (설계 단계)
+        self.K = self.compute_lqr_gain()
+
+    def compute_lqr_gain(self):
+        """
+        C++의 computeLQR() 함수를 Python의 ct.lqr()로 대체합니다.
+        """
+        try:
+            # K = LQR 게인, P = 리카티 해, E = 고유값
+            K, P, E = ct.lqr(self.A, self.B, self.Q, self.R)
+            print("--- LQR 게인 K 계산 성공 ---")
+            print(K)
+            return K
+        except Exception as e:
+            print(f"LQR 계산 오류: {e}")
+            return None
+
+    def get_output(self, current_state):
+        """
+        LQR 제어 법칙 u = -K(x - x_des) 적용
+        """
+        if self.K is None:
+            return 0.0 # K 계산 실패 시 0 반환
+
+        state_error = np.asarray(current_state) - self.desired_state
+        
+        # u = -K * e
+        u = -self.K.dot(state_error)
+        
+        return u.item()
+
+# --- 2. 동역학 모델 (LQR 피드백 적용) (물리 모델 수정 완료) ---
+def pendulum_dynamics_lqr(t, y, M, m, L, g, b_cart, b_pendulum, controller):
+    """
+    LQR 컨트롤러의 피드백을 받아 움직이는 비선형(Non-linear) 물리 모델
+    (물리 법칙에 맞게 행렬 연산으로 수정)
+    """
+    u = controller.get_output(y)
+    
+    # 상태 벡터 y = [x, x_dot, theta, theta_dot]
+    x_dot = y[1]
+    theta = y[2]
+    theta_dot = y[3]
+    
+    Sy = np.sin(theta)
+    Cy = np.cos(theta)
+    
+    # 1. 질량 행렬 M(q)
+    M_mat = np.array([
+        [M + m, m * L * Cy],
+        [m * L * Cy, m * L**2]
+    ])
+    
+    # 2. 나머지 힘 벡터 C(q, q_dot) + G(q) + D(q_dot)
+    RHS = np.array([
+        u - b_cart * x_dot + m * L * Sy * theta_dot**2,
+        -m * g * L * Sy - b_pendulum * theta_dot
+    ])
+    
+    # 3. M(q) * [x_ddot, theta_ddot] = RHS 를 풀어서 가속도를 구함
+    try:
+        accels = np.linalg.solve(M_mat, RHS)
+        x_ddot = accels[0]
+        theta_ddot = accels[1]
+    except np.linalg.LinAlgError:
+        x_ddot = 0.0
+        theta_ddot = 0.0
+    
+    return [y[1], x_ddot, y[3], theta_ddot]
+
+# --- 3. 시뮬레이션 실행 ---
+if __name__ == '__main__':
+    # 3-1. 물리 파라미터 설정
+    M, m, L, g = 100.0, 5.0, 25.0, 9.81
+    
+    # 저항값 (고객님 설정값)
+    b_cart = 1.0    
+    b_pendulum = 0.5 
+
+    # 3-2. LQR을 위한 선형화(Linearization) 모델 정의
+    # (물리적으로 올바른 A, B 행렬)
+    A = np.array([
+        [0, 1, 0, 0],
+        [0, -b_cart/M, (m*g)/M, 0],
+        [0, 0, 0, 1],
+        [0, b_cart/(M*L), -(M+m)*g/(M*L), -b_pendulum/(M*L)]
+    ])
+    
+    B = np.array([
+        [0],
+        [1/M],
+        [0],
+        [-1/(M*L)] 
+    ])
+
+
+    # 3-3. LQR 비용 행렬 (Q, R) 설정 (★★성능 튜닝★★)
+    
+    # Q: 상태 오차 비용 [x, x_dot, theta, theta_dot]
+    # 진자 각도(Q[2,2])와 각속도(Q[3,3])에 대한 페널티를 대폭 상향!
+    Q = np.diag([100.0, 1.0, 5000.0, 100.0]) # <-- Q[2,2]를 1000->5000, Q[3,3]을 1.0->100.0
+    
+    # R: 제어 에너지 비용 (힘 u)
+    # R 값을 낮춰서 모터를 더 적극적으로 사용하도록 허용!
+    R = np.array([[0.1]]) # <-- R을 1.0 -> 0.1
+
+    # 3-4. 제어기 생성
+    desired_state = np.array([5.0, 0.0, 0.0, 0.0]) 
+    controller = LQRControllerPython(A, B, Q, R, desired_state)
+
+    # 3-5. 시뮬레이션 설정
+    t_total = 500.0 # <-- 고객님 설정 500초
+    t_span = [0, t_total]
+    
+    # 초기 상태: 0m, 정지, 60도 (라디안으로 변환) 기울어진 상태에서 시작
+    initial_angle_deg = 60.0
+    initial_angle_rad = np.deg2rad(initial_angle_deg)
+    initial_state = [0.0, 0.0, initial_angle_rad, 0.0] 
+
+    # --- 시뮬레이션 실행 ---
+    sol = solve_ivp(
+        pendulum_dynamics_lqr, t_span, initial_state, 
+        args=(M, m, L, g, b_cart, b_pendulum, controller), 
+        dense_output=True, rtol=1e-6, atol=1e-9
+    )
+
+    # --- 4. 결과 그래프 시각화 (Degree 변환) ---
+    t_plot = np.linspace(t_span[0], t_span[1], 1000) # 500 -> 1000 포인트로 증가
+    y_plot = sol.sol(t_plot)
+    
+    cart_position = y_plot[0]
+    pendulum_angle_rad = y_plot[2]
+    pendulum_angle_deg = pendulum_angle_rad * 180 / np.pi 
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+    # 그래프 1: 카트 위치 (x)
+    ax1.plot(t_plot, cart_position, label='카트 위치 (LQR 제어)', color='blue')
+    ax1.axhline(desired_state[0], color='black', linestyle='--', label=f'목표 위치 ({desired_state[0]:.1f}m)')
+    ax1.set_ylabel('Cart Position (m)')
+    ax1.set_title('LQR Anti-Sway 제어 시뮬레이션 (성능 튜닝)', fontsize=16)
+    ax1.legend()
+    ax1.grid(True)
+
+    # 그래프 2: 진자 각도 (Degree)
+    ax2.plot(t_plot, pendulum_angle_deg, label='진자 각도 (LQR 제어)', color='red') 
+    ax2.axhline(desired_state[2], color='black', linestyle='--', label=f'목표 각도 ({desired_state[2]:.1f} deg)')
+    ax2.set_ylabel('Pendulum Angle (degree)') 
+    ax2.set_xlabel('Time (s)')
+    ax2.legend()
+    ax2.grid(True)
+
+    plt.tight_layout()
+    plt.show()
